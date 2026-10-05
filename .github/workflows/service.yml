@@ -1,0 +1,127 @@
+# One pipeline for every kubernetes-mail-server service, called from each repository's own workflow.
+#
+#   pull_request        build the image (no push, no deploy): a broken build shows up before merging
+#   push to master      build, push, deploy to the mail-server namespace, wait until it is ready
+#   workflow_dispatch   same as a push, to redeploy by hand
+#
+# Deploying needs the org secret CLUSTER_CONFIG (callers pass `secrets: inherit`): a kubeconfig for
+# the mail-server-deploy-account ServiceAccount on s1, which may deploy in mail-server and nothing else.
+name: service
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Service name; also the Deployment/StatefulSet and image name.
+        type: string
+        required: true
+      kind:
+        description: deployment or statefulset
+        type: string
+        default: deployment
+      replicas:
+        type: number
+        default: 1
+      namespace:
+        type: string
+        default: mail-server
+      build:
+        description: false for services that run an upstream image (redis)
+        type: boolean
+        default: true
+      helm-args:
+        description: Extra helm template arguments; may use $(kubectl ...) to read the cluster.
+        type: string
+        default: ""
+      before-deploy:
+        description: Shell run before scaling down, e.g. deleting a finished Job.
+        type: string
+        default: ""
+
+concurrency:
+  group: deploy-${{ inputs.name }}
+  cancel-in-progress: false
+
+env:
+  KUBECTL_VERSION: v1.33.1   # s1's API server
+  HELM_VERSION: v3.17.3
+
+jobs:
+  build:
+    if: inputs.build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ inputs.name }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    # Runs when the build succeeded, or was skipped because the service has no image of its own.
+    if: >-
+      always() && github.event_name != 'pull_request' &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: ubuntu-24.04
+    env:
+      NS: ${{ inputs.namespace }}
+      TARGET: ${{ inputs.kind }}/${{ inputs.name }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+      - uses: azure/setup-helm@v4
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - name: Kubeconfig
+        env:
+          CLUSTER_CONFIG: ${{ secrets.CLUSTER_CONFIG }}
+        run: |
+          umask 077
+          printf '%s\n' "$CLUSTER_CONFIG" > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Before deploy
+        if: inputs.before-deploy != ''
+        run: ${{ inputs.before-deploy }}
+      - name: Scale down
+        run: |
+          kubectl -n "$NS" get "$TARGET" && kubectl -n "$NS" scale --replicas=0 "$TARGET" || true
+      - name: Install
+        run: |
+          set -euo pipefail
+          repo_args=()
+          if [ -n "$DIGEST" ]; then repo_args=(--set "repository=ghcr.io/${{ github.repository_owner }}/${{ inputs.name }}@$DIGEST"); fi
+          helm template \
+            --set name=${{ inputs.name }} \
+            --set namespace="$NS" \
+            "${repo_args[@]}" \
+            ${{ inputs.helm-args }} \
+            ./kubernetes | kubectl apply -f -
+      - name: Scale up and wait
+        run: |
+          kubectl -n "$NS" scale --replicas=${{ inputs.replicas }} "$TARGET"
+          # Green only once the new pods are ready: opendkim was "deployed" in February while it
+          # crash-looped for eight months.
+          kubectl -n "$NS" rollout status "$TARGET" --timeout=10m
