@@ -37,6 +37,10 @@ on:
         description: Shell run before scaling down, e.g. deleting a finished Job.
         type: string
         default: ""
+      after-deploy:
+        description: Shell run once the rollout is ready, e.g. waiting for a migrations Job.
+        type: string
+        default: ""
 
 concurrency:
   group: deploy-${{ inputs.name }}
@@ -105,7 +109,11 @@ jobs:
       - name: Before deploy
         if: inputs.before-deploy != ''
         run: ${{ inputs.before-deploy }}
+      # A Deployment's rolling update would start the new pod beside the old one; scaling to zero
+      # first keeps the old behaviour. A StatefulSet already replaces its pod one at a time, and only
+      # when the template changed, so a redeploy with nothing new leaves dovecot and the database up.
       - name: Scale down
+        if: inputs.kind == 'deployment'
         run: |
           kubectl -n "$NS" get "$TARGET" && kubectl -n "$NS" scale --replicas=0 "$TARGET" || true
       - name: Install
@@ -125,3 +133,6 @@ jobs:
           # Green only once the new pods are ready: opendkim was "deployed" in February while it
           # crash-looped for eight months.
           kubectl -n "$NS" rollout status "$TARGET" --timeout=10m
+      - name: After deploy
+        if: inputs.after-deploy != ''
+        run: ${{ inputs.after-deploy }}
